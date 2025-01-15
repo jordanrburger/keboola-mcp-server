@@ -8,26 +8,57 @@ A Model Context Protocol (MCP) server for interacting with Keboola Connection. T
 
 ## Installation
 
-First, clone the repository and create a virtual environment:
+First, install `uv` if you haven't already:
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Then clone the repository and create a virtual environment:
 
 ```bash
 git clone https://github.com/jordanburger/keboola-mcp-server.git
 cd keboola-mcp-server
-python3 -m venv .venv
+uv venv
 source .venv/bin/activate
 ```
 
 Install the package in development mode:
 
 ```bash
-pip3 install -e .
+uv pip install -e .
 ```
 
 For development dependencies:
 
 ```bash
-pip3 install -e ".[dev]"
+uv pip install -e ".[dev]"
 ```
+
+## Running the MCP Inspector
+
+To test the server locally with the MCP Inspector:
+
+1. Make sure you're in the virtual environment:
+```bash
+source .venv/bin/activate
+```
+
+2. Set your Keboola Storage API token:
+```bash
+export KBC_STORAGE_TOKEN="your-keboola-storage-token"
+```
+
+3. Run the server with the MCP Inspector:
+```bash
+uv pip install mcp[inspector]  # Install the inspector if you haven't already
+uv run -m mcp.inspector -s "uv run -m keboola_mcp_server.cli --api-url https://connection.YOUR_REGION.keboola.com"
+```
+
+Replace:
+- `your-keboola-storage-token` with your actual Keboola Storage API token
+- `YOUR_REGION` with your Keboola region (e.g., `north-europe.azure`, `connection`, etc.)
+
+The MCP Inspector will open in your default web browser, allowing you to test all available tools and resources.
 
 ## Claude Desktop Setup
 
@@ -43,8 +74,9 @@ To use this server with Claude Desktop, follow these steps:
 {
   "mcpServers": {
     "keboola": {
-      "command": "/path/to/keboola-mcp-server/.venv/bin/python",
+      "command": "/usr/local/bin/uv",
       "args": [
+        "run",
         "-m",
         "keboola_mcp_server.cli",
         "--log-level",
@@ -62,6 +94,7 @@ To use this server with Claude Desktop, follow these steps:
 ```
 
 Replace:
+- `/usr/local/bin/uv` with the path to your `uv` installation (find it using `which uv`)
 - `/path/to/keboola-mcp-server` with your actual path to the cloned repository
 - `your-keboola-storage-token` with your Keboola Storage API token
 - `YOUR_REGION` with your Keboola region (e.g., `north-europe.azure`, `connection`, etc.)
@@ -76,9 +109,9 @@ Replace:
 If you encounter connection issues:
 1. Check the logs in Claude Desktop for any error messages
 2. Verify your Keboola Storage API token is correct
-3. Ensure all paths in the configuration are absolute paths
-4. Confirm the virtual environment is properly activated and all dependencies are installed
-5. Make sure the PYTHONPATH points to the `src` directory
+3. Ensure all paths in the configuration are absolute paths (use `which uv` to find the correct path)
+4. Make sure the PYTHONPATH points to the `src` directory
+5. Try running the server with the MCP Inspector to test if it works outside Claude Desktop
 
 ## Available Tools
 
@@ -95,20 +128,20 @@ The server provides the following tools for interacting with Keboola Connection:
 Run tests:
 
 ```bash
-pytest
+uv run pytest
 ```
 
 Format code:
 
 ```bash
-black .
-isort .
+uv run black .
+uv run isort .
 ```
 
 Type checking:
 
 ```bash
-mypy .
+uv run mypy .
 ```
 
 ## License
