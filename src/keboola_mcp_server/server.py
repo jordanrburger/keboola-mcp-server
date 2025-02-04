@@ -9,14 +9,11 @@ from io import StringIO
 from typing import Any, AsyncGenerator, Dict, List, Optional, TypedDict, cast
 
 import pandas as pd
-import snowflake.connector
 from mcp.server.fastmcp import FastMCP
-from snowflake.connector.connection import SnowflakeConnection
-from snowflake.snowpark import Session
-from snowflake.snowpark.functions import col
 
 from .client import KeboolaClient
 from .config import Config
+from .database import create_snowflake_connection, ConnectionManager, DatabasePathManager
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +60,8 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
 
     # Configure logging
     handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"))
     logger.addHandler(handler)
     logger.setLevel(config.log_level)
 
@@ -71,6 +69,9 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
     mcp = FastMCP(
         "Keboola Explorer", dependencies=["keboola.storage-api-client", "httpx", "pandas"]
     )
+
+    connection_manager = ConnectionManager(config)
+    db_path_manager = DatabasePathManager(config, connection_manager)
 
     # Create Keboola client instance
     try:
@@ -80,25 +81,7 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
         raise
     logger.info("Successfully initialized Keboola client")
 
-    async def get_table_db_path(table: dict) -> str:
-        """Get the database path for a specific table."""
-
-        db_path = await get_current_db()
-        table_name = table["name"]
-        table_path = table["id"]
-        if table.get("sourceTable"):
-            db_path = f"KEBOOLA_{table['sourceTable']['project']['id']}"
-            table_path = table["sourceTable"]["id"]
-
-        table_identifier = f'"{db_path}"."{".".join(table_path.split(".")[:-1])}"."{table_name}"'
-        return table_identifier
-
-    async def get_current_db() -> str:
-        """Get the current database."""
-        return f"KEBOOLA_{config.storage_token.split('-')[0]}"
-
     # Resources
-
     @mcp.resource("keboola://buckets")
     async def list_buckets() -> List[BucketInfo]:
         """List all available buckets in Keboola project."""
@@ -108,7 +91,8 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
     @mcp.resource("keboola://buckets/{bucket_id}/tables")
     async def list_bucket_tables(bucket_id: str) -> str:
         """List all tables in a specific bucket."""
-        tables = cast(List[Dict[str, Any]], keboola.storage_client.buckets.list_tables(bucket_id))
+        tables = cast(List[Dict[str, Any]],
+                      keboola.storage_client.buckets.list_tables(bucket_id))
         return "\n".join(
             f"- {table['id']}: {table['name']} (Rows: {table.get('rowsCount', 'unknown')})"
             for table in tables
@@ -130,7 +114,8 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
 
         # Get column info
         columns = table.get("columns", [])
-        column_info = [TableColumnInfo(name=col, db_identifier=f'"{col}"') for col in columns]
+        column_info = [TableColumnInfo(
+            name=col, db_identifier=f'"{col}"') for col in columns]
 
         return {
             "id": table["id"],
@@ -141,21 +126,50 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
             "data_size_bytes": table.get("dataSizeBytes", 0),
             "columns": columns,
             "column_identifiers": column_info,
-            "db_identifier": await get_table_db_path(table),
+            "db_identifier": db_path_manager.get_table_db_path(table),
         }
 
-    # TODO: fix the implementation of query_table_data
-    # @mcp.tool()
+    @mcp.tool()
     async def query_table_data(
         table_id: str,
         columns: Optional[List[str]] = None,
         where: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> str:
-        """Query table data using proper DB identifiers."""
+        """
+        Query table data using database identifiers with proper formatting. This method safely constructs
+        and executes SQL queries by handling database identifiers and query parameters.
+
+        Parameters:
+            table_id (str): The table identifier in format 'bucket.table_name' (e.g., 'in.c-fraudDetection.test_identify')
+            columns (List[str], optional): List of column names to select. If None, selects all columns (*)
+            where (str, optional): WHERE clause conditions without the 'WHERE' keyword
+            limit (int, optional): Maximum number of rows to return
+
+        Returns:
+            str: Query results in string format
+
+        Examples:
+            # Select all columns with limit
+            query_table_data('in.c-fraudDetection.test_identify', limit=5)
+
+            # Select specific columns with condition
+            query_table_data(
+                'in.c-fraudDetection.test_identify',
+                columns=['TransactionID', 'DeviceType'],
+                where="DeviceType = 'mobile'",
+                limit=10
+            )
+
+        Note:
+            This method is preferred over direct SQL queries as it:
+                - Automatically handles proper database identifiers
+                - Prevents SQL injection through proper parameter handling
+                - Uses configuration for database name
+                - Provides a simpler interface for common query patterns
+        """
         table_info = await get_table_detail(table_id)
 
-        # Build column list with proper identifiers
         if columns:
             column_map = {
                 col["name"]: col["db_identifier"] for col in table_info["column_identifiers"]
@@ -174,34 +188,22 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
 
         result: str = await query_table(query)
         return result
-        
+
     @mcp.tool()
     async def query_table(sql_query: str) -> str:
         """
-            Execute a Snowflake SQL query to get data from the Storage.
-        
-            Note: SQL queries must include the full path including database name, e.g.:
-            'SELECT * FROM SAPI_10025."in.c-fraudDetection"."test_identify"'
+        Execute a Snowflake SQL query to get data from the Storage. Before forming the query always check the 
+        get_table_metadata tool to get the correct database name and table name. 
+
+        Note: SQL queries must include the full path including database name, e.g.:
+        'SELECT * FROM SAPI_10025."in.c-fraudDetection"."test_identify"'. Snowflake is case sensitive so always
+        wrap the column names in double quotes.
         """
-
-        # Execute query
-        if not config.has_snowflake_config():
-            raise ValueError("Snowflake credentials not fully configured")
-
         conn = None
         cursor = None
 
         try:
-            conn = snowflake.connector.connect(
-                account=config.snowflake_account,
-                user=config.snowflake_user,
-                password=config.snowflake_password,
-                warehouse=config.snowflake_warehouse,
-                database=config.snowflake_database,
-                schema=config.snowflake_schema,
-                role=config.snowflake_role,
-            )
-            
+            conn = create_snowflake_connection(config)
             cursor = conn.cursor()
             cursor.execute(sql_query)
             result = cursor.fetchall()
@@ -212,13 +214,15 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
             writer = csv.writer(output)
             writer.writerow(columns)
             writer.writerows(result)
+
             return output.getvalue()
 
         except snowflake.connector.errors.ProgrammingError as e:
             raise ValueError(f"Snowflake query error: {str(e)}")
 
         except Exception as e:
-            raise ValueError(f"Unexpected error during query execution: {str(e)}")
+            raise ValueError(
+                f"Unexpected error during query execution: {str(e)}")
 
         finally:
             if cursor:
@@ -251,7 +255,8 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
     @mcp.tool()
     async def get_bucket_metadata(bucket_id: str) -> str:
         """Get detailed information about a specific bucket."""
-        bucket = cast(Dict[str, Any], keboola.storage_client.buckets.detail(bucket_id))
+        bucket = cast(Dict[str, Any],
+                      keboola.storage_client.buckets.detail(bucket_id))
         return (
             f"Bucket Information:\n"
             f"ID: {bucket['id']}\n"
@@ -266,7 +271,8 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
     async def get_table_metadata(table_id: str) -> Dict[str, Any]:
         """Get detailed information about a specific table including its DB identifier and column information."""
         # Get table details directly from the storage client
-        table = cast(Dict[str, Any], keboola.storage_client.tables.detail(table_id))
+        table = cast(Dict[str, Any],
+                     keboola.storage_client.tables.detail(table_id))
         return table
 
     @mcp.tool()
@@ -287,7 +293,8 @@ def create_server(config: Optional[Config] = None) -> FastMCP:
     @mcp.tool()
     async def list_bucket_tables_tool(bucket_id: str) -> str:
         """List all tables in a specific bucket with their basic information."""
-        tables = cast(List[Dict[str, Any]], keboola.storage_client.buckets.list_tables(bucket_id))
+        tables = cast(List[Dict[str, Any]],
+                      keboola.storage_client.buckets.list_tables(bucket_id))
         return "\n".join(
             f"Table: {table['id']}\n"
             f"Name: {table.get('name', 'N/A')}\n"
